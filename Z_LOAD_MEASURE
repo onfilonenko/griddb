@@ -1,0 +1,1863 @@
+
+" Wizard Upload measure for employees
+REPORT Z_LOAD_MEASURE.
+  TYPE-POOLS:
+           ICON.
+  CONSTANTS:
+    zc_tcode     TYPE SY-TCODE VALUE 'ZHR_MASS_F1_06',
+    zc_msgid     TYPE BAL_S_MSG-MSGID VALUE 'ZHR_REPORTS',
+    zc_logobj    TYPE BALOBJ_D VALUE 'ZHR_IT_LOG',
+    zc_logobjsub TYPE BALOBJ_D VALUE 'ZHR_IT0000_F1_06',
+    zc_logext    TYPE BALNREXT VALUE 'ZHR_UPLOAD_VAC'.
+
+  DATA:
+    ZMASSS  TYPE FLAG,
+    ZFILE   TYPE CHAR255,
+    ZPATH   TYPE STRING,
+    GT_VDAT TYPE ZET_I0000_F1_06,
+    GO_CUST_CONT TYPE REF TO CL_GUI_CUSTOM_CONTAINER.
+
+INITIALIZATION.
+  " Authority check
+  CALL FUNCTION 'AUTHORITY_CHECK_TCODE'
+    EXPORTING
+      TCODE         = zc_tcode
+    EXCEPTIONS
+      OK            = 1
+      NOT_OK        = 2
+      OTHERS        = 3.
+  CHECK SY-SUBRC <> 1.
+  LEAVE.
+
+START-OF-SELECTION.
+  PERFORM z_wiz_proc.
+
+END-OF-SELECTION.
+
+
+INCLUDE:
+  z_sys_bdc_engine, " BDC engine
+  z_app_pa_util,    " Application PA forms
+  <WIZARD>.         " Wizard utilites
+
+"---------------------------------------------------------------------
+"      Form  Z_CONVERT_DATA
+"      Upload data from file
+"---------------------------------------------------------------------
+"      <-- FC_T_DAT  Converted data table
+"      <-- FC_T_SRC  Source data table
+"---------------------------------------------------------------------
+FORM Z_CONVERT_DATA CHANGING
+                          FC_T_DAT TYPE STANDARD TABLE
+                          FC_T_SRC TYPE ZET_EX_TABLINE.
+  DATA:
+    lv_type TYPE c,
+    lv_line TYPE i,
+    lv_size TYPE i,
+    ls_fmap TYPE ZES_EX_FMAP,
+    lt_fmap TYPE HASHED TABLE OF ZES_EX_FMAP WITH UNIQUE KEY COL.
+
+  FIELD-SYMBOLS:
+    <fs_fmap>  TYPE ZES_EX_FMAP,
+    <fs_data>  TYPE LINE OF ZET_EX_TABLINE,
+    <fs_s_dat> TYPE ANY,
+    <fs_value> TYPE ANY.
+
+  REFRESH:
+    FC_T_DAT.
+  " Build field catalog by first row source data table
+  APPEND INITIAL LINE TO FC_T_DAT ASSIGNING <fs_s_dat>.
+  CHECK <fs_s_dat> IS ASSIGNED.
+  LOOP AT FC_T_SRC ASSIGNING <fs_data> WHERE E_ROW = 1.
+    ls_fmap-col = <fs_data>-e_col.
+    ls_fmap-name = <fs_data>-e_value.
+    TRANSLATE ls_fmap-name TO UPPER CASE.  "#EC TRANSLANG
+    ASSIGN COMPONENT ls_fmap-name OF STRUCTURE <fs_s_dat> TO <fs_value>.
+    IF SY-SUBRC = 0.
+      INSERT ls_fmap INTO TABLE lt_fmap.
+    ELSE.
+      DELETE FC_T_SRC WHERE E_ROW <> 1 AND E_COL = <fs_data>-e_col.
+    ENDIF.
+  ENDLOOP.
+  DELETE FC_T_SRC WHERE E_ROW = 1.
+  " Prepare data table
+  lv_line = LINES( FC_T_DAT ).
+  DELETE FC_T_DAT INDEX lv_line.
+
+  CHECK LINES( lt_fmap ) > 0.
+  SORT lt_fmap BY COL.
+
+  " Prepare source data table
+  SORT FC_T_SRC BY E_ROW E_COL.
+  LOOP AT FC_T_SRC ASSIGNING <fs_data>.
+    AT NEW E_ROW.
+      APPEND INITIAL LINE TO FC_T_DAT ASSIGNING <fs_s_dat>.
+      ASSIGN COMPONENT 'E_ROW' OF STRUCTURE <fs_s_dat> TO <fs_value>.
+      IF SY-SUBRC = 0.
+        <fs_value> = <fs_data>-e_row.
+      ENDIF.
+    ENDAT.
+    READ TABLE lt_fmap ASSIGNING <fs_fmap> WITH KEY COL = <fs_data>-e_col.
+    CHECK SY-SUBRC = 0.
+    ASSIGN COMPONENT <fs_fmap>-name OF STRUCTURE <fs_s_dat> TO <fs_value>.
+    CHECK SY-SUBRC = 0.
+    TRY.
+      DESCRIBE FIELD <fs_value> TYPE lv_type.
+      IF lv_type = 'D'.
+        lv_size = STRLEN( <fs_data>-e_value ).
+        CASE lv_size.
+          WHEN 10.
+            <fs_value>+0(4) = <fs_data>-e_value+6(4). " Year
+            <fs_value>+4(2) = <fs_data>-e_value+3(2). " Month
+            <fs_value>+6(2) = <fs_data>-e_value+0(2). " Day
+          WHEN 9.
+            <fs_value>+0(4) = <fs_data>-e_value+5(4). " Year
+            <fs_value>+4(2) = <fs_data>-e_value+2(2). " Month
+            <fs_value>+7(1) = <fs_data>-e_value+0(1). " Day
+            <fs_value>+6(1) = 0.                      " Day
+        ENDCASE.
+      ELSE.
+        <fs_value> = <fs_data>-e_value.
+      ENDIF.
+    ENDTRY.
+  ENDLOOP.
+ENDFORM.  " Z_CONVERT_DATA
+"---------------------------------------------------------------------
+"      Form  Z_CHECK_PERNR
+"      Check data
+"---------------------------------------------------------------------
+"      --> FU_PERNR  Personal number
+"      <-- FC_RC     Return code
+"---------------------------------------------------------------------
+FORM Z_CHECK_PERNR USING
+                      FU_PERNR
+                CHANGING
+                      FC_RC TYPE SY-SUBRC.
+  DATA:
+    lv_pernr  TYPE BAPIEMPL-PERNR,
+    ls_return TYPE BAPIRETURN.
+
+  FC_RC = 4.
+
+  lv_pernr = FU_PERNR.
+  CALL FUNCTION 'BAPI_EMPLOYEE_CHECKEXISTENCE'
+    EXPORTING
+      NUMBER = lv_pernr
+    IMPORTING
+      RETURN = ls_return.
+  CHECK ls_return-type <> 'E'.
+  CLEAR:
+    FC_RC.
+ENDFORM.  " Z_CHECK_PERNR
+"---------------------------------------------------------------------
+"      Form  Z_CHECK_LOCK
+"      Check lock personal numbers
+"---------------------------------------------------------------------
+"      <-- FC_T_DAT  Data table
+"---------------------------------------------------------------------
+FORM Z_CHECK_LOCK CHANGING
+                        FC_T_DAT TYPE ZET_I0000_F1_06.
+  DATA:
+    lv_user   TYPE SY-UNAME,
+    lv_pernr  TYPE BAPIP0001-PERNR,
+    ls_msg    TYPE BAL_S_MSG,
+    ls_return TYPE BAPIRETURN1.
+
+  FIELD-SYMBOLS:
+    <fs_data>  TYPE LINE OF ZET_I0000_F1_06.
+
+  DELETE FC_T_DAT WHERE STATE = ICON_LED_RED.
+  SORT FC_T_DAT BY PERNR.
+  LOOP AT FC_T_DAT ASSIGNING <fs_data>.
+    " WHERE STATE = ICON_LED_GREEN
+    "    OR STATE = ICON_LED_YELLOW
+    "    OR STATE = ICON_LOCKED.
+    " Check lock personal numbers
+    CLEAR:
+      lv_user,
+      ls_return.
+    lv_pernr = <fs_data>-pernr.
+    <fs_data>-state = ICON_LED_GREEN.
+    CALL FUNCTION 'HR_EMPLOYEE_ENQUEUE'
+      EXPORTING
+        NUMBER       = lv_pernr
+      IMPORTING
+        RETURN       = ls_return
+        LOCKING_USER = lv_user.
+    IF ls_return-type = 'E'
+    OR ls_return-type = 'A'.
+      " MESSAGE personal number &1 locked &2
+      CLEAR: ls_msg.
+      ls_msg-msgid = zc_msgid.
+      ls_msg-msgno = '411'.
+      ls_msg-msgv1 = lv_pernr.
+      ls_msg-msgv1 = lv_user.
+      PERFORM z_get_msg_text USING ls_msg CHANGING <fs_data>-mtext.
+      <fs_data>-state = ICON_LOCKED.
+    ENDIF.
+    CALL FUNCTION 'HR_EMPLOYEE_DEQUEUE'
+      EXPORTING
+        NUMBER = lv_pernr
+      IMPORTING
+        RETURN = ls_return.
+
+    " TODO Check lock's T569V
+  ENDLOOP.
+  SORT FC_T_DAT BY E_ROW.
+ENDFORM.  " Z_CHECK_LOCK
+"---------------------------------------------------------------------
+"      Form  Z_CHECK_DATA
+"      Check data
+"---------------------------------------------------------------------
+"      <-- FC_T_DAT  Data table
+"---------------------------------------------------------------------
+FORM Z_CHECK_DATA CHANGING
+                        FC_T_DAT TYPE ZET_I0000_F1_06.
+  DATA:
+    lv_rc      TYPE SY-SUBRC,
+    lt_deduc   TYPE TABLE OF P2006,
+    ls_msg     TYPE BAL_S_MSG,
+    ls_p0001   TYPE P0001,
+    lt_p0001   TYPE TABLE OF P0001,
+    lt_p0000   TYPE TABLE OF P0000,
+    lt_p0298   TYPE TABLE OF P0298,
+    lt_p0302   TYPE TABLE OF P0302,
+    lt_p2001   TYPE TABLE OF P2001,
+    lt_p2002   TYPE TABLE OF P2002,
+    lt_p2006   TYPE TABLE OF P2006,
+    lv_hdate   TYPE d,
+    lv_quota   TYPE ANZHL,
+    lv_vacat   TYPE ANZHL,
+    lv_pernr   TYPE PERNR_D.
+
+  FIELD-SYMBOLS:
+    <fs_data>  TYPE LINE OF ZET_I0000_F1_06.
+  SORT FC_T_DAT BY PERNR ADATE.
+  LOOP AT FC_T_DAT ASSIGNING <fs_data>.
+    <fs_data>-state = ICON_LED_GREEN.
+    IF lv_pernr <> <fs_data>-pernr.
+      lv_pernr = <fs_data>-pernr.
+      " Read infotypes only for new personal numbers
+      REFRESH:
+        lt_p0000.
+      CALL FUNCTION 'HR_READ_INFOTYPE_AUTHC_DISABLE'.
+      CALL FUNCTION 'HR_READ_INFOTYPE'
+        EXPORTING
+          PERNR           = <fs_data>-pernr
+          INFTY           = '0000'
+          BYPASS_BUFFER   = 'X'
+        TABLES
+          INFTY_TAB       = lt_p0000
+        EXCEPTIONS
+          INFTY_NOT_FOUND = 1
+          OTHERS          = 2.
+      IF SY-SUBRC <> 0.
+        REFRESH:
+          lt_p0000.
+      ENDIF.
+      DELETE lt_p0000 WHERE SPRPS IS NOT INITIAL.
+
+      REFRESH:
+        lt_p0298.
+      CALL FUNCTION 'HR_READ_INFOTYPE_AUTHC_DISABLE'.
+      CALL FUNCTION 'HR_READ_INFOTYPE'
+        EXPORTING
+          PERNR           = <fs_data>-pernr
+          INFTY           = '0298'
+          BYPASS_BUFFER   = 'X'
+        TABLES
+          INFTY_TAB       = lt_p0298
+        EXCEPTIONS
+          INFTY_NOT_FOUND = 1
+          OTHERS          = 2.
+      IF SY-SUBRC <> 0.
+        REFRESH:
+          lt_p0298.
+      ENDIF.
+      DELETE lt_p0298 WHERE SPRPS IS NOT INITIAL.
+
+      REFRESH:
+        lt_p0302.
+      CALL FUNCTION 'HR_READ_INFOTYPE_AUTHC_DISABLE'.
+      CALL FUNCTION 'HR_READ_INFOTYPE'
+        EXPORTING
+          PERNR           = <fs_data>-pernr
+          INFTY           = '0302'
+          BYPASS_BUFFER   = 'X'
+        TABLES
+          INFTY_TAB       = lt_p0302
+        EXCEPTIONS
+          INFTY_NOT_FOUND = 1
+          OTHERS          = 2.
+      IF SY-SUBRC <> 0.
+        REFRESH:
+          lt_p0302.
+      ENDIF.
+      DELETE lt_p0302 WHERE SPRPS IS NOT INITIAL.
+
+      REFRESH:
+        lt_p2001.
+      CALL FUNCTION 'HR_READ_INFOTYPE_AUTHC_DISABLE'.
+      CALL FUNCTION 'HR_READ_INFOTYPE'
+        EXPORTING
+          PERNR           = <fs_data>-pernr
+          INFTY           = '2001'
+          BYPASS_BUFFER   = 'X'
+        TABLES
+          INFTY_TAB       = lt_p2001
+        EXCEPTIONS
+          OTHERS          = 0.
+      DELETE lt_p2001
+       WHERE SPRPS IS NOT INITIAL.
+
+      REFRESH:
+        lt_p2002.
+      CALL FUNCTION 'HR_READ_INFOTYPE_AUTHC_DISABLE'.
+      CALL FUNCTION 'HR_READ_INFOTYPE'
+        EXPORTING
+          PERNR           = <fs_data>-pernr
+          INFTY           = '2002'
+          BYPASS_BUFFER   = 'X'
+        TABLES
+          INFTY_TAB       = lt_p2002
+        EXCEPTIONS
+          INFTY_NOT_FOUND = 1
+          OTHERS          = 2.
+      IF SY-SUBRC <> 0.
+        REFRESH:
+          lt_p2002.
+      ENDIF.
+      DELETE lt_p2002 WHERE SPRPS IS NOT INITIAL.
+
+      REFRESH:
+        lt_p2006,
+        lt_deduc.
+      CALL FUNCTION 'HR_READ_INFOTYPE_AUTHC_DISABLE'.
+      CALL FUNCTION 'HR_READ_INFOTYPE'
+        EXPORTING
+          PERNR           = <fs_data>-pernr
+          INFTY           = '2006'
+          BYPASS_BUFFER   = 'X'
+        TABLES
+          INFTY_TAB       = lt_p2006
+        EXCEPTIONS
+          OTHERS          = 0.
+      DELETE lt_p2006
+       WHERE SPRPS IS NOT INITIAL
+          OR KTART <> '40'.
+    ENDIF.
+    " Check employee personal number
+    PERFORM z_check_pernr USING
+                             <fs_data>-pernr
+                       CHANGING
+                             lv_rc.
+    IF lv_rc > 0.
+      " MESSAGE Personal number &1 not found
+      CLEAR: ls_msg.
+      ls_msg-msgid = zc_msgid.
+      ls_msg-msgno = '403'.
+      ls_msg-msgv1 = <fs_data>-pernr.
+      PERFORM z_get_msg_text USING ls_msg CHANGING <fs_data>-mtext.
+      <fs_data>-state = ICON_LED_RED.
+      CONTINUE.
+    ENDIF.
+    " Check dates
+    IF <fs_data>-vacend < <fs_data>-adate.
+      " MESSAGE Wrong period &1 - &2
+      CLEAR: ls_msg.
+      ls_msg-msgid = zc_msgid.
+      ls_msg-msgno = '401'.
+      WRITE <fs_data>-adate  TO ls_msg-msgv1.
+      WRITE <fs_data>-vacend TO ls_msg-msgv2.
+      PERFORM z_get_msg_text USING ls_msg CHANGING <fs_data>-mtext.
+      <fs_data>-state = ICON_LED_RED.
+      CONTINUE.
+    ENDIF.
+    IF <fs_data>-vacend(1) <> '1'
+    AND <fs_data>-vacend(1) <> '2'
+    AND <fs_data>-vacend <> '99991231'
+    AND <fs_data>-vacend <> '00000000'.
+      " MESSAGE Wrong date &1
+      CLEAR: ls_msg.
+      ls_msg-msgid = zc_msgid.
+      ls_msg-msgno = '400'.
+      WRITE <fs_data>-vacend TO ls_msg-msgv1.
+      PERFORM z_get_msg_text USING ls_msg CHANGING <fs_data>-mtext.
+      <fs_data>-state = ICON_LED_RED.
+      CONTINUE.
+    ENDIF.
+    IF <fs_data>-adate(1) <> '1'
+    AND <fs_data>-adate(1) <> '2'
+    AND <fs_data>-adate <> '99991231'
+    AND <fs_data>-adate <> '00000000'.
+      " MESSAGE Wrong date &1
+      CLEAR: ls_msg.
+      ls_msg-msgid = zc_msgid.
+      ls_msg-msgno = '400'.
+      WRITE <fs_data>-adate TO ls_msg-msgv1.
+      PERFORM z_get_msg_text USING ls_msg CHANGING <fs_data>-mtext.
+      <fs_data>-state = ICON_LED_RED.
+      CONTINUE.
+    ENDIF.
+
+    " Check IT 0000
+    LOOP AT lt_p0000 TRANSPORTING NO FIELDS
+      WHERE BEGDA <= <fs_data>-vacend
+        AND ENDDA >= <fs_data>-adate
+        AND STAT2 = '0'.
+    ENDLOOP.
+    IF SY-SUBRC = 0.
+      " MESSAGE Personal number &1 fired
+      CLEAR: ls_msg.
+      ls_msg-msgid = zc_msgid.
+      ls_msg-msgno = '402'.
+      ls_msg-msgv1 = <fs_data>-pernr.
+      PERFORM z_get_msg_text USING ls_msg CHANGING <fs_data>-mtext.
+      <fs_data>-state = ICON_LED_RED.
+      CONTINUE.
+    ENDIF.
+    " Check IT 0298
+    LOOP AT lt_p0298 TRANSPORTING NO FIELDS
+      WHERE BEGDA = <fs_data>-adate
+        AND MASSN = 'F1'
+        AND MASSG = '06'.
+    ENDLOOP.
+    IF SY-SUBRC = 0.
+      " MESSAGE For personal number &1 form &2 already exist
+      CLEAR: ls_msg.
+      ls_msg-msgid = zc_msgid.
+      ls_msg-msgno = '404'.
+      ls_msg-msgv1 = <fs_data>-pernr.
+      ls_msg-msgv2 = TEXT-T00.
+      PERFORM z_get_msg_text USING ls_msg CHANGING <fs_data>-mtext.
+      <fs_data>-state = ICON_LED_RED.
+      CONTINUE.
+    ENDIF.
+
+    " Check IT 0302
+    LOOP AT lt_p0302 TRANSPORTING NO FIELDS
+      WHERE BEGDA = <fs_data>-adate
+        AND MASSN = 'F1'
+        AND MASSG = '06'.
+    ENDLOOP.
+    IF SY-SUBRC = 0.
+      " MESSAGE Action on date &1 already exist
+      CLEAR: ls_msg.
+      ls_msg-msgid = zc_msgid.
+      ls_msg-msgno = '405'.
+      WRITE <fs_data>-adate TO ls_msg-msgv1.
+      PERFORM z_get_msg_text USING ls_msg CHANGING <fs_data>-mtext.
+      <fs_data>-state = ICON_LED_RED.
+      CONTINUE.
+    ENDIF.
+    " Check IT 2001
+    LOOP AT lt_p2001 TRANSPORTING NO FIELDS
+      WHERE BEGDA <= <fs_data>-vacend
+        AND ENDDA >= <fs_data>-adate.
+    ENDLOOP.
+    IF SY-SUBRC = 0.
+      " MESSAGE In period &1 - &2 exist absence
+      CLEAR: ls_msg.
+      ls_msg-msgid = zc_msgid.
+      ls_msg-msgno = '406'.
+      WRITE <fs_data>-adate  TO ls_msg-msgv1.
+      WRITE <fs_data>-vacend TO ls_msg-msgv2.
+      PERFORM z_get_msg_text USING ls_msg CHANGING <fs_data>-mtext.
+      <fs_data>-state = ICON_LED_RED.
+      CONTINUE.
+    ENDIF.
+    " Check IT 2002
+    LOOP AT lt_p2002 TRANSPORTING NO FIELDS
+      WHERE BEGDA <= <fs_data>-vacend
+        AND ENDDA >= <fs_data>-adate.
+    ENDLOOP.
+    IF SY-SUBRC = 0.
+      " MESSAGE In period &1 - &2 exist presence
+      CLEAR: ls_msg.
+      ls_msg-msgid = zc_msgid.
+      ls_msg-msgno = '407'.
+      WRITE <fs_data>-adate  TO ls_msg-msgv1.
+      WRITE <fs_data>-vacend TO ls_msg-msgv2.
+      PERFORM z_get_msg_text USING ls_msg CHANGING <fs_data>-mtext.
+      <fs_data>-state = ICON_LED_RED.
+      CONTINUE.
+    ENDIF.
+    " Check quotas deduction
+    PERFORM z_get_deduc USING
+                           <fs_data>-pernr
+                           '40'
+                           <fs_data>-adate
+                           <fs_data>-vacend
+                           lt_p2001
+                           lt_p2006
+                     CHANGING
+                           lt_deduc
+                           lv_rc.
+    CASE lv_rc.
+      WHEN 1.
+        " MESSAGE No quota
+        CLEAR: ls_msg.
+        ls_msg-msgid = zc_msgid.
+        ls_msg-msgno = '419'.
+        ls_msg-msgv1 = <fs_data>-pernr.
+        ls_msg-msgv2 = '40'.
+        PERFORM z_get_msg_text USING ls_msg CHANGING <fs_data>-mtext.
+        <fs_data>-state = ICON_LED_RED.
+        CONTINUE.
+      WHEN 2.
+        " MESSAGE Quota deduction error
+        CLEAR: ls_msg.
+        ls_msg-msgid = zc_msgid.
+        ls_msg-msgno = '420'.
+        ls_msg-msgv1 = <fs_data>-pernr.
+        ls_msg-msgv2 = '40'.
+        PERFORM z_get_msg_text USING ls_msg CHANGING <fs_data>-mtext.
+        <fs_data>-state = ICON_LED_RED.
+        CONTINUE.
+    ENDCASE.
+
+    " Check chief personal number
+    IF <fs_data>-chper IS INITIAL.
+      " MESSAGE Chief personal number empty
+      CLEAR: ls_msg.
+      ls_msg-msgid = zc_msgid.
+      ls_msg-msgno = '410'.
+      PERFORM z_get_msg_text USING ls_msg CHANGING <fs_data>-mtext.
+      <fs_data>-state = ICON_LED_YELLOW.
+    ELSE.
+      PERFORM z_check_pernr USING
+                         <fs_data>-chper
+                   CHANGING
+                         lv_rc.
+      IF lv_rc > 0.
+        " MESSAGE Personal number &1 not found
+        CLEAR: ls_msg.
+        ls_msg-msgid = zc_msgid.
+        ls_msg-msgno = '403'.
+        ls_msg-msgv1 = <fs_data>-chper.
+        PERFORM z_get_msg_text USING ls_msg CHANGING <fs_data>-mtext.
+        <fs_data>-state = ICON_LED_RED.
+        CONTINUE.
+      ENDIF.
+    ENDIF.
+  ENDLOOP.
+  " Restore records sort
+  SORT FC_T_DAT BY E_ROW.
+ENDFORM.  " Z_CHECK_DATA
+"---------------------------------------------------------------------
+"      Form  Z_LOAD_DATA_VAC
+"      Load data vacantions
+"---------------------------------------------------------------------
+"      --> FU_PATH   Upload path
+"      --> FU_SPLIT  Split symbol
+"      <-- FC_T_DAT  Data table
+"---------------------------------------------------------------------
+" ICON_BREAKEPOINT
+" ICON_LED_GREEN
+" ICON_LED_RED
+" ICON_LED_YELLOW
+FORM Z_LOAD_DATA_VAC USING
+                        FU_OBJECT TYPE BALOBJ_D
+                        FU_SUBOBJ TYPE BALOBJ_D
+                        FU_EXTNUM TYPE BALNREXT
+                  CHANGING
+                        FC_T_DAT TYPE ZET_I0000_F1_06.
+  " PERNR;ADATE;VACEND;ORDNU;ORDDT;CHPER
+  " 00062507;26.08.2019;09.09.2019;85-о;05.08.2019;52387
+  CONSTANTS:
+   lc_tcode TYPE SY-TCODE    VALUE 'PA40',
+   lc_massn TYPE P0000-MASSN VALUE 'F1'.
+
+  DATA:
+    lo_log        TYPE BAL_S_LOG,
+    lo_log_appl   TYPE REF TO CL_CUX_APPL_LOG,
+    lo_log_handle TYPE BALLOGHNDL,
+    lt_msg        TYPE BAL_T_MSG,
+"    lv_str        TYPE STRING,
+    lv_userg      TYPE USERG,
+    lv_m_pos      TYPE STRING,
+"    lt_data       TYPE ZET_EX_TABLINE,
+"    lt_vdat       TYPE ZET_I0000_F1_06,
+    lt_bdcm       TYPE TAB_BDCMSGCOLL,
+    lt_p2001      TYPE TABLE OF P2001.
+
+  FIELD-SYMBOLS:
+    <fs_msg>  TYPE LINE OF BAL_T_MSG,
+    <fs_bdcm> TYPE LINE OF TAB_BDCMSGCOLL,
+    <fs_vdat> TYPE LINE OF ZET_I0000_F1_06.
+
+  lo_log-object    = FU_OBJECT.
+  lo_log-subobject = FU_SUBOBJ.
+  lo_log-extnumber = FU_EXTNUM.
+  lo_log-aldate    = SY-DATUM.
+  lo_log-altime    = SY-UZEIT.
+  lo_log-aluser    = SY-UNAME.
+  lo_log-alprog    = SY-REPID.
+  CALL FUNCTION 'BAL_LOG_CREATE'
+    EXPORTING
+      I_S_LOG      = lo_log
+    IMPORTING
+      E_LOG_HANDLE = lo_log_handle
+    EXCEPTIONS
+      OTHERS       = 1.
+  CHECK SY-SUBRC = 0.
+  CREATE OBJECT lo_log_appl
+    EXPORTING
+      IV_HANDLE    = lo_log_handle
+      IV_OBJECT    = FU_OBJECT
+      IV_SUBOBJECT = FU_SUBOBJ
+    EXCEPTIONS
+      OTHERS       = 1.
+  CHECK SY-SUBRC = 0.
+  LOOP AT FC_T_DAT ASSIGNING <fs_vdat>
+    WHERE STATE = ICON_LED_GREEN
+       OR STATE = ICON_LED_YELLOW.
+    PERFORM ZGET_USERG USING
+                          <fs_vdat>-pernr
+                    CHANGING
+                          lv_userg.
+    PERFORM zget_menu_pos USING
+                             lc_tcode
+                             lc_massn
+                             lv_userg
+                       CHANGING
+                             lv_m_pos.
+    CONCATENATE 'RP50G-SELEC(' lv_m_pos ')' INTO lv_m_pos RESPECTING BLANKS.
+
+    REFRESH:
+      lt_bdcm,
+      gt_bdcdata.
+    z_bdc_dynpro 'SAPMP50A' '2200' 'X'.
+    " z_bdc_set_cursor 'T529T-MNTXT(10)'.
+    z_bdc_set_okcode '=PICK'.
+    z_bdc_set_conv_field 'RP50G-EINDA' <fs_vdat>-adate.    " Action date
+    z_bdc_set_field lv_m_pos 'X'.                          " Action kind
+    " BDC_SUBSCR  SAPMP50A
+    z_bdc_set_field 'RP50G-PERNR' <fs_vdat>-pernr.         " Personal number
+    " BDC_SUBSCR  /1PAPAXX/HDR_30000A
+"==========================================
+    z_bdc_dynpro 'MP000000' '2000' 'X'.
+    z_bdc_set_cursor 'P0000-MASSG'.
+    z_bdc_set_okcode 'UPD'.
+    z_bdc_set_conv_field 'P0000-BEGDA' <fs_vdat>-adate.    " Action date
+    z_bdc_set_field 'P0000-MASSN' lc_massn.                " Action kind
+    z_bdc_set_field 'P0000-MASSG' '06'.                    " Action reason
+"==========================================
+    z_bdc_dynpro 'MP200000' '2001' 'X'.
+    " z_bdc_set_cursor 'P2001-ENDDA'.
+    z_bdc_set_okcode '=UPD'.                               " Leave low than 14 days
+    z_bdc_set_conv_field 'P2001-BEGDA' <fs_vdat>-adate.    " Action date
+    z_bdc_set_conv_field 'P2001-ENDDA' <fs_vdat>-vacend.   " Vacantion end date
+"==========================================
+    z_bdc_dynpro 'MP200000' '2001' 'X'.
+    " z_bdc_set_cursor 'P2001-ENDDA'.
+    z_bdc_set_okcode '/ENXT'.                              " Leave more than 14 days
+"==========================================
+    z_bdc_dynpro 'MP029800' '2000' 'X'.                    " Fill and save form T-6
+    z_bdc_set_okcode '=UPD'.
+    IF ZMASSS <> ABAP_TRUE.
+      z_bdc_set_field 'P0298-MASSS' '01'.                  " Order detail reason
+    ENDIF.
+    z_bdc_set_field 'P0298-ORDNU' <fs_vdat>-ordnu.         " Order number
+    z_bdc_set_conv_field 'P0298-ORDDT' <fs_vdat>-orddt.    " Order date
+    z_bdc_set_field 'P0298-CHPER' <fs_vdat>-chper.         " Chief personal number
+    " BDC_SUBSCR                     ZP029800
+"==========================================
+    z_bdc_dynpro 'MP029800' '2000' 'X'.                    " Skip print T-6
+    z_bdc_set_okcode '/ENXT'.
+"==========================================
+
+    CALL TRANSACTION lc_tcode USING gt_bdcdata MODE 'N' MESSAGES INTO lt_bdcm.
+    LOOP AT lt_bdcm ASSIGNING <fs_bdcm>.
+      APPEND INITIAL LINE TO lt_msg ASSIGNING <fs_msg>.
+      <fs_msg>-msgid = <fs_bdcm>-msgid.
+      <fs_msg>-msgty = <fs_bdcm>-msgtyp.
+      <fs_msg>-msgno = <fs_bdcm>-msgnr.
+      <fs_msg>-msgv1 = <fs_bdcm>-msgv1.
+      <fs_msg>-msgv2 = <fs_bdcm>-msgv2.
+      <fs_msg>-msgv3 = <fs_bdcm>-msgv3.
+      <fs_msg>-msgv4 = <fs_bdcm>-msgv4.
+      CHECK <fs_bdcm>-msgtyp = 'E'
+         OR <fs_bdcm>-msgtyp = 'A'.
+      <fs_vdat>-state = ICON_INCOMPLETE.
+      CALL FUNCTION 'BAL_DSP_TXT_MSG_READ'
+        EXPORTING
+          I_LANGU              = SY-LANGU
+          I_MSGID              = <fs_msg>-msgid
+          I_MSGNO              = <fs_msg>-msgno
+          I_MSGV1              = <fs_msg>-msgv1
+          I_MSGV2              = <fs_msg>-msgv2
+          I_MSGV3              = <fs_msg>-msgv3
+          I_MSGV4              = <fs_msg>-msgv4
+        IMPORTING
+          E_MESSAGE_TEXT       = <fs_vdat>-mtext.
+    ENDLOOP.
+
+    CHECK <fs_vdat>-state = ICON_LED_GREEN.
+    " Check record
+    REFRESH:
+      lt_p2001.
+    CALL FUNCTION 'HR_READ_INFOTYPE_AUTHC_DISABLE'.
+    CALL FUNCTION 'HR_READ_INFOTYPE'
+      EXPORTING
+        PERNR           = <fs_vdat>-pernr
+        INFTY           = '2001'
+        BEGDA           = <fs_vdat>-adate
+        ENDDA           = <fs_vdat>-vacend
+        BYPASS_BUFFER   = 'X'
+      TABLES
+        INFTY_TAB       = lt_p2001
+      EXCEPTIONS
+        INFTY_NOT_FOUND = 1
+        OTHERS          = 2.
+    IF SY-SUBRC = 0.
+      LOOP AT lt_p2001 TRANSPORTING NO FIELDS
+        WHERE SPRPS IS INITIAL
+          AND SUBTY = '0601'
+          AND BEGDA = <fs_vdat>-adate
+          AND ENDDA = <fs_vdat>-vacend
+          AND AWART = '0601'.
+        <fs_vdat>-state = ICON_CHECKED.
+        <fs_vdat>-mtext = TEXT-TOK.
+      ENDLOOP.
+    ENDIF.
+    IF <fs_vdat>-state <> ICON_CHECKED.
+      <fs_vdat>-state = ICON_INCOMPLETE.
+    ENDIF.
+  ENDLOOP.
+
+  " Save log
+  IF LINES( lt_msg ) > 0.
+    PERFORM z_msg_log USING
+                         lo_log_appl
+                   CHANGING
+                         lt_msg.
+    CALL METHOD lo_log_appl->save_messages
+      EXCEPTIONS
+        LOG_ERROR = 1
+        OTHERS    = 2.
+  ENDIF.
+  "CHECK SY-BATCH <> 'X'.
+  " Show log
+  "CALL METHOD lo_log_appl->display
+  "  EXPORTING
+  "    IV_SINGLE         = 'X'
+  "    IV_POPUP          = SPACE
+  "    IV_GRID           = 'X'
+  "  EXCEPTIONS
+  "    NO_DATA_AVAILABLE = 1
+  "    INTERNAL_ERROR    = 2
+  "    OTHERS            = 3.
+ENDFORM.  " Z_LOAD_DATA_VAC
+"---------------------------------------------------------------------
+"      Form  Z_CONVERT_EXTAB
+"      Convert text table to data table
+"---------------------------------------------------------------------
+"      --> FU_TEXT   Text table
+"      --> FU_SPLIT  Split symbol
+"      <-- FC_DATA   Data exchange table
+"---------------------------------------------------------------------
+FORM Z_CONVERT_EXTAB USING
+                        FU_TEXT  TYPE ZET_TLINE_4096
+                        FU_SPLIT TYPE c
+                  CHANGING
+                        FC_DATA  TYPE ZET_EX_TABLINE.
+
+  DATA:
+    lv_e_row TYPE SY-TABIX,
+    lv_e_col TYPE ZE_EX_COL_N,
+    lv_fdpos TYPE SY-FDPOS.
+
+  FIELD-SYMBOLS:
+    <fs_text> TYPE ZES_TLINE_4096,
+    <fs_data> TYPE ZES_EX_TABLINE.
+
+  REFRESH:
+    FC_DATA.
+
+  LOOP AT FU_TEXT ASSIGNING <fs_text>.
+    lv_e_row = SY-TABIX.
+    lv_e_col = 0.
+    WHILE <fs_text> CA FU_SPLIT.
+      lv_fdpos = SY-FDPOS.
+      ADD 1 TO lv_e_col.
+      PERFORM z_set_ex_cell USING
+                                lv_e_row
+                                lv_e_col
+                                FU_SPLIT
+                                lv_fdpos
+                          CHANGING
+                                <fs_text>
+                                FC_DATA.
+    ENDWHILE.
+    IF <fs_text> <> space.
+      APPEND INITIAL LINE TO FC_DATA ASSIGNING <fs_data>.
+      <fs_data>-e_row  = lv_e_row.
+      <fs_data>-e_col  = lv_e_col + 1.
+      <fs_data>-e_value = <fs_text>.
+    ENDIF.
+  ENDLOOP.
+ENDFORM.  " Z_CONVERT_EXTAB
+"---------------------------------------------------------------------
+"      Form  Z_SET_EX_CELL
+"      Set exchange table cell
+"---------------------------------------------------------------------
+"      --> FU_SPLIT  Split symbol
+"      <-- FC_TLINE  Text table line
+"      <-- FC_DATA   Data exchange table
+"---------------------------------------------------------------------
+FORM Z_SET_EX_CELL USING
+                      FU_E_ROW TYPE SY-TABIX
+                      FU_E_COL TYPE ZE_EX_COL_N
+                      FU_SPLIT TYPE c
+                      FU_FDPOS TYPE SY-FDPOS
+                CHANGING
+                      FC_TLINE TYPE ZES_TLINE_4096
+                      FC_DATA  TYPE ZET_EX_TABLINE.
+
+  DATA:
+    lv_tline TYPE ZES_TLINE_4096,
+    lv_fdpos TYPE i,
+    ls_data  TYPE LINE OF ZET_EX_TABLINE.
+
+  lv_tline = FC_TLINE.
+  lv_fdpos = FU_FDPOS.
+  ls_data-e_row = FU_E_ROW.
+  ls_data-e_col = FU_E_COL.
+  " CSV-format process: --> ;"abc;cd";
+  IF  ( FU_SPLIT = ';' OR FU_SPLIT = ',' )
+  AND lv_tline(1) = '"'.
+    PERFORM z_escape_split USING
+                              FU_SPLIT
+                        CHANGING
+                              lv_tline
+                              lv_fdpos
+                              ls_data-e_value.
+  ELSE.
+    IF lv_fdpos > 0.
+      ls_data-e_value = FC_TLINE(lv_fdpos).
+    ENDIF.
+  ENDIF.
+  IF lv_fdpos > 0.
+    APPEND ls_data TO FC_DATA.
+  ENDIF.
+  ADD 1 TO lv_fdpos.
+  FC_TLINE = FC_TLINE+lv_fdpos.
+ENDFORM.  " Z_SET_EX_CELL
+
+"---------------------------------------------------------------------
+"      Form  Z_ESCAPE_SPLIT
+"      Parse CSV format
+"---------------------------------------------------------------------
+"      --> FU_SPLIT  Split symbol
+"      --> FC_TLINE  Text line
+"      --> FC_FDPOS  Field position
+"      <-- FC_VALUE  Field
+"---------------------------------------------------------------------
+FORM Z_ESCAPE_SPLIT USING
+                       FU_SPLIT TYPE c
+                 CHANGING
+                       FC_TLINE TYPE ZES_TLINE_4096
+                       FC_FDPOS TYPE i
+                       FC_VALUE TYPE ZES_EX_TABLINE-E_VALUE.
+  DATA:
+    lv_int TYPE i,
+    lv_end TYPE c LENGTH 2.
+
+  FIELD-SYMBOLS:
+    <fs_cell>.
+
+  lv_end+0(1) = '"'.
+  lv_end+1(1) = FU_SPLIT .
+  IF FC_TLINE CS '"'.
+    FC_TLINE = FC_TLINE+1.
+    IF FC_TLINE CS lv_end.
+      lv_int = SY-FDPOS.
+      ASSIGN FC_TLINE(lv_int) TO <fs_cell>.
+      FC_VALUE = <fs_cell>.
+      ADD 2 TO lv_int.
+      FC_FDPOS = lv_int.
+      FC_TLINE = FC_TLINE+lv_int.
+    ELSEIF FC_TLINE CS '"'.
+      lv_int = SY-FDPOS.
+      ASSIGN FC_TLINE(lv_int) TO <fs_cell>.
+      FC_VALUE = <fs_cell>.
+      ADD 1 TO lv_int.
+      FC_FDPOS = lv_int.
+      FC_TLINE = FC_TLINE+lv_int.
+      lv_int = strlen( FC_TLINE ).
+      IF lv_int > 0 .
+        " TODO Message 'Not CSV format'
+      ENDIF.
+    ELSE.
+      " TODO Message 'Not CSV format'
+    ENDIF.
+  ENDIF.
+ENDFORM.  " Z_ESCAPE_SPLIT
+
+"---------------------------------------------------------------------
+"      Form  Z_UPLOAD_FILE
+"      Upload data from file
+"---------------------------------------------------------------------
+"      --> FU_PATH   Upload path
+"      --> FU_SPLIT  Split symbol
+"      --> FU_ECOL   End column
+"      <-- FC_DATA   Data table
+"---------------------------------------------------------------------
+FORM Z_UPLOAD_FILE USING
+                      FU_PATH  TYPE STRING
+                      FU_SPLIT TYPE c
+                      FU_ECOL  TYPE i
+                CHANGING
+                      FC_DATA  TYPE ZET_EX_TABLINE.
+  DATA:
+    lv_b_row  TYPE i,
+    lv_e_row  TYPE i,
+"    lv_b_col  TYPE i,
+    lv_e_col  TYPE i,
+    lv_n_buff TYPE i,  " Number buffered rows
+    lt_data   TYPE TABLE OF ALSMEX_TABLINE,
+    lt_text   TYPE ZET_TLINE_4096,
+"    ls_text   TYPE LINE OF ZET_TLINE_4096,
+    lv_split  TYPE c,
+    lv_path   TYPE RLGRAP-FILENAME,
+    lv_ext    TYPE STRING.
+
+  FIELD-SYMBOLS:
+    <fs_alsm> TYPE ALSMEX_TABLINE,
+    <fs_data> TYPE LINE OF ZET_EX_TABLINE.
+
+  REFRESH:
+    FC_DATA.
+
+  lv_path = FU_PATH.
+  CALL FUNCTION 'CH_SPLIT_FILENAME'
+    EXPORTING
+      COMPLETE_FILENAME = FU_PATH
+    IMPORTING
+      EXTENSION         = lv_ext
+   EXCEPTIONS
+      OTHERS            = 1.
+  " File loading error - wrong path
+  CHECK SY-SUBRC = 0.
+  WHILE lv_ext CS '.'.
+    CALL FUNCTION 'CH_SPLIT_FILENAME'
+      EXPORTING
+        COMPLETE_FILENAME = lv_ext
+      IMPORTING
+        EXTENSION         = lv_ext
+     EXCEPTIONS
+        OTHERS            = 1.
+    " File loading error - wrong path
+    CHECK SY-SUBRC <> 0.
+    EXIT.
+  ENDWHILE.
+  TRANSLATE lv_ext TO UPPER CASE.
+
+  CASE lv_ext.
+    WHEN 'TXT'.
+      REFRESH lt_text.
+      CALL FUNCTION 'GUI_UPLOAD'
+        EXPORTING
+          FILENAME = FU_PATH
+        TABLES
+          DATA_TAB = lt_text
+        EXCEPTIONS
+          OTHERS   = 1.
+      IF SY-SUBRC = 0.
+        IF FU_SPLIT IS INITIAL OR FU_SPLIT = SPACE.
+          " Load text file with tab-symbol splitter
+          lv_split = cl_abap_char_utilities=>horizontal_tab.
+        ELSE.
+          lv_split = FU_SPLIT.
+        ENDIF.
+        PERFORM z_convert_extab USING
+                                   lt_text
+                                   lv_split
+                             CHANGING
+                                   FC_DATA.
+      ELSE.
+        " File loading error
+        MESSAGE I092(ZHR_REPORTS) WITH SPACE.
+      ENDIF.
+    " Load CSV file with <;> splitter
+    WHEN 'CSV'.
+      REFRESH lt_text.
+      CALL FUNCTION 'GUI_UPLOAD'
+        EXPORTING
+          FILENAME = FU_PATH
+        TABLES
+          DATA_TAB = lt_text
+        EXCEPTIONS
+          OTHERS   = 1.
+      IF SY-SUBRC = 0.
+        lv_split = ';'.
+        PERFORM z_convert_extab USING
+                                   lt_text
+                                   lv_split
+                             CHANGING
+                                   FC_DATA.
+      ELSE.
+        " File loading error
+        MESSAGE I092(ZHR_REPORTS) WITH SPACE.
+      ENDIF.
+    " Load Ms Excel file
+    WHEN 'XLS'.
+      lv_b_row = 1.
+      lv_n_buff  = 2000.    " TODO dynamic from cols and rows
+      lv_e_col   = FU_ECOL. " TODO dynamic for 0 cols
+      DO 1000 TIMES.        " TODO dynamic n  from rows and n_buffer
+        lv_e_row = lv_b_row + lv_n_buff - 1.
+        REFRESH:
+          lt_data.
+        IF lv_b_row > 65536.
+          EXIT.
+        ENDIF.
+        IF lv_e_row > 65536.
+          lv_e_row = 65536.
+          lv_n_buff  = lv_e_row - lv_b_row + 1.
+          " Loading warning -limited rows
+          MESSAGE I093(ZHR_REPORTS).
+        ENDIF.
+        CALL FUNCTION 'ALSM_EXCEL_TO_INTERNAL_TABLE'
+          EXPORTING
+            FILENAME    = lv_path
+            I_BEGIN_COL = '1'
+            I_BEGIN_ROW = lv_b_row
+            I_END_COL   = lv_e_col
+            I_END_ROW   = lv_e_row
+          TABLES
+            INTERN      = lt_data
+          EXCEPTIONS
+            OTHERS      = 1.
+        IF SY-SUBRC <> 0.
+          REFRESH:
+            FC_DATA.
+          " Loading error
+          MESSAGE I092(ZHR_REPORTS) WITH SPACE.
+          EXIT.
+        ENDIF.
+        lv_b_row = lv_e_row + 1.
+        lv_e_row = lv_e_row - lv_n_buff.
+        LOOP AT lt_data ASSIGNING <fs_alsm>.
+          APPEND INITIAL LINE TO FC_DATA ASSIGNING <fs_data>.
+          <fs_data>-e_value = <fs_alsm>-value.
+          <fs_data>-e_row   = lv_e_row + <fs_alsm>-row.
+          <fs_data>-e_col   = <fs_alsm>-col.
+        ENDLOOP.
+        CHECK SY-SUBRC <> 0.
+        EXIT.
+      ENDDO.
+    WHEN 'XLSX'.
+      lv_b_row = 1.
+      lv_n_buff  = 2000.    " TODO dynamic from cols and rows
+      lv_e_col   = FU_ECOL. " TODO dynamic for 0 cols
+      DO 1000 TIMES.        " TODO dynamic n  from rows and n_buffer
+        lv_e_row = lv_b_row + lv_n_buff - 1.
+        REFRESH:
+          lt_data.
+        CALL FUNCTION 'ALSM_EXCEL_TO_INTERNAL_TABLE'
+          EXPORTING
+            FILENAME    = lv_path
+            I_BEGIN_COL = '1'
+            I_BEGIN_ROW = lv_b_row
+            I_END_COL   = lv_e_col
+            I_END_ROW   = lv_e_row
+          TABLES
+            INTERN      = lt_data
+          EXCEPTIONS
+            OTHERS      = 1.
+        IF SY-SUBRC <> 0.
+          REFRESH:
+            FC_DATA.
+          " Loading error
+          MESSAGE I092(ZHR_REPORTS) WITH SPACE.
+          EXIT.
+        ENDIF.
+        lv_b_row = lv_e_row + 1.
+        lv_e_row = lv_e_row - lv_n_buff.
+        LOOP AT lt_data ASSIGNING <fs_alsm>.
+          APPEND INITIAL LINE TO FC_DATA ASSIGNING <fs_data>.
+          <fs_data>-e_value = <fs_alsm>-value.
+          <fs_data>-e_row   = lv_e_row + <fs_alsm>-row.
+          <fs_data>-e_col   = <fs_alsm>-col.
+        ENDLOOP.
+        CHECK SY-SUBRC <> 0.
+        EXIT.
+      ENDDO.
+    WHEN OTHERS.
+      " Loading error - unsupported file format
+      MESSAGE I092(ZHR_REPORTS) WITH SPACE.
+  ENDCASE.
+  FREE lt_data.
+ENDFORM.  " Z_UPLOAD_FILE
+"----------------------------------------------------------------------
+"       Form  Z_SHOW_PROGRESS
+"       Show message text in progress bar
+"----------------------------------------------------------------------
+"      --> FU_STEXT  Message text
+"----------------------------------------------------------------------
+FORM Z_SHOW_PROGRESS USING
+                        FU_STEXT. "#EC CALLED
+  DATA:
+    lv_stext TYPE SY-UCOMM.
+
+  lv_stext = FU_STEXT.
+  CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
+    EXPORTING
+      TEXT = lv_stext.
+ENDFORM.  " Z_SHOW_PROGRESS
+"---------------------------------------------------------------------
+"      Form  Z_MSG_LOG
+"      Add messages to log
+"---------------------------------------------------------------------
+"      --> FU_NO_LOG  No logger flag
+"      <-- FC_MSG     Messages table
+"---------------------------------------------------------------------
+FORM Z_MSG_LOG USING
+                  FU_O_APPL TYPE REF TO CL_CUX_APPL_LOG
+            CHANGING
+                  FC_MSG    TYPE BAL_T_MSG.
+  FIELD-SYMBOLS:
+    <fs_msg> TYPE BAL_S_MSG.
+
+  LOOP AT FC_MSG ASSIGNING <fs_msg>.
+    CONDENSE <fs_msg>-msgv1.
+    CONDENSE <fs_msg>-msgv2.
+    CONDENSE <fs_msg>-msgv3.
+    CONDENSE <fs_msg>-msgv4.
+    CALL METHOD FU_O_APPL->ADD_MESSAGE
+      EXPORTING
+        IV_MSGTY = <fs_msg>-msgty
+        IV_MSGID = <fs_msg>-msgid
+        IV_MSGNO = <fs_msg>-msgno
+        IV_MSGV1 = <fs_msg>-msgv1
+        IV_MSGV2 = <fs_msg>-msgv2
+        IV_MSGV3 = <fs_msg>-msgv3
+        IV_MSGV4 = <fs_msg>-msgv4
+      EXCEPTIONS
+       OTHERS         = 1.
+  ENDLOOP.
+  CLEAR FC_MSG.
+ENDFORM.  " Z_MSG_LOG
+"----------------------------------------------------------------------
+"       Form  Z_WIZ_SET_STEP
+"       Set wizard process step
+"----------------------------------------------------------------------
+"      --> FU_FORM     Step process form
+"      --> FU_TEXT     Step text
+"      <-- FC_T_STEPS  Steps table
+"----------------------------------------------------------------------
+FORM Z_WIZ_SET_STEP USING
+                       FU_FORM TYPE SWF_WIZDEF-FORM
+                       FU_TEXT TYPE SWF_WIZDEF-TEXT
+                 CHANGING
+                       FC_T_STEPS TYPE ANY TABLE.
+  DATA:
+    ls_steps TYPE SWF_WIZDEF,
+    lt_steps TYPE TABLE OF SWF_WIZDEF.
+
+  lt_steps = FC_T_STEPS.
+  ls_steps-program = SY-CPROG.
+  ls_steps-form = FU_FORM.
+  ls_steps-text = FU_TEXT.
+  APPEND ls_steps TO lt_steps.
+  FC_T_STEPS = lt_steps.
+ENDFORM.  " Z_WIZ_SET_STEP
+
+"----------------------------------------------------------------------
+"       Form  Z_WIZ_PROC
+"       Wizard process
+"----------------------------------------------------------------------
+FORM Z_WIZ_PROC.
+  DATA:
+    lt_steps TYPE TABLE OF SWF_WIZDEF.
+
+  PERFORM z_wiz_set_step USING 'Z_WIZ_PROC_STEP_00' TEXT-S00 CHANGING lt_steps.
+  PERFORM z_wiz_set_step USING 'Z_WIZ_PROC_STEP_01' TEXT-S01 CHANGING lt_steps.
+  PERFORM z_wiz_set_step USING 'Z_WIZ_PROC_STEP_02' TEXT-S02 CHANGING lt_steps.
+  PERFORM z_wiz_set_step USING 'Z_WIZ_PROC_STEP_03' TEXT-S03 CHANGING lt_steps.
+  PERFORM z_wiz_set_step USING 'Z_WIZ_PROC_STEP_04' TEXT-S04 CHANGING lt_steps.
+
+  CALL FUNCTION 'SWF_WIZARD_PROCESS'
+    EXPORTING
+      CONTAINER_COMPENSATION            = ''
+      PROCESS_LOGGING                   = 'X'
+      ROADMAP                           = 'X'
+      START_COLUMN                      = 5
+      START_ROW                         = 2
+      SIZE                              = 'L'
+      AMODAL                            = ' '
+      DO_INIT                           = ' '
+      CALLBACK_PROGRAM                  = ' '
+    TABLES
+      DEFINITION                        = lt_steps
+    EXCEPTIONS
+      OPERATION_CANCELLED_BY_USER       = 1
+      PROCESS_IN_ERROR                  = 2
+      OTHERS                            = 3.
+  IF SY-SUBRC <> 0.
+
+  ENDIF.
+ENDFORM.  " Z_WIZARD_PROC
+"----------------------------------------------------------------------
+"       Form  Z_WIZ_PROC_STEP_00
+"       Process wizard step 00
+"----------------------------------------------------------------------
+"      --> CONTAINER Table container
+"      --> COMMAND
+"----------------------------------------------------------------------
+FORM Z_WIZ_PROC_STEP_00 TABLES
+                            CONTAINER "#EC NEEDED
+                         USING
+                            COMMAND. "#EC CALLED
+  DATA:
+    ls_data type swf_wizard.
+
+
+  swf_include 'Z_WIZ_PROC_STEP_04' SY-CPROG.
+  " Initialize wizard step
+  ls_data-title      = SY-TITLE.
+  ls_data-descobject = 'ZHR_MASS_F1_06_00'.
+  ls_data-docuobject = ' '.
+  ls_data-SCREEN_TYP = 'STRT'.
+  ls_data-subscpool1 = SY-CPROG.
+  ls_data-back_off   = 'X'.
+
+  " Process wizard step
+  call function 'SWF_WIZARD_CALL'
+    EXPORTING
+      wizard_data                 = ls_data
+    EXCEPTIONS
+      operation_cancelled_by_user = 01
+      back                        = 02.
+  swf_evaluate command.
+
+ENDFORM.  " Z_WIZ_PROC_STEP_00
+
+"----------------------------------------------------------------------
+"       Form  Z_WIZ_PROC_STEP_01
+"       Process wizard step 01
+"----------------------------------------------------------------------
+"      --> CONTAINER Table container
+"      --> COMMAND
+"----------------------------------------------------------------------
+FORM Z_WIZ_PROC_STEP_01 TABLES
+                            CONTAINER "#EC NEEDED
+                         USING
+                            COMMAND.  "#EC CALLED
+  DATA:
+    ls_data type swf_wizard.
+
+  CLEAR:
+    ZPATH,
+    ZFILE,
+    GT_VDAT[].
+
+  swf_include 'Z_WIZ_PROC_STEP_02' SY-CPROG.
+  swf_include 'Z_WIZ_PROC_STEP_03' SY-CPROG.
+  swf_include 'Z_WIZ_PROC_STEP_04' SY-CPROG.
+
+  " Initialize wizard step
+  ls_data-title      = SY-TITLE.
+  ls_data-descobject = 'ZHR_MASS_F1_06_01'.
+  ls_data-docuobject = ' '.
+  ls_data-subscpool1 = SY-CPROG.
+  ls_data-subscreen1 = '2001'.
+
+  " Process wizard step
+  call function 'SWF_WIZARD_CALL'
+    EXPORTING
+      wizard_data                 = ls_data
+    EXCEPTIONS
+      operation_cancelled_by_user = 01
+      back                        = 02.
+
+  swf_evaluate command.
+  CHECK ZPATH IS INITIAL.
+  ZPATH = ZFILE.
+ENDFORM.  " Z_WIZ_PROC_STEP_01
+
+"----------------------------------------------------------------------
+"       Form  Z_WIZ_PROC_STEP_02
+"       Process wizard step 02
+"----------------------------------------------------------------------
+"      --> CONTAINER Table container
+"      --> COMMAND
+"----------------------------------------------------------------------
+FORM Z_WIZ_PROC_STEP_02 TABLES
+                            CONTAINER "#EC NEEDED
+                         USING
+                            COMMAND.  "#EC CALLED
+  DATA:
+    lv_str  TYPE STRING,
+    lt_data TYPE ZET_EX_TABLINE,
+    ls_data type swf_wizard.
+
+  swf_include 'Z_WIZ_PROC_STEP_04' SY-CPROG.
+
+  " Initialize wizard step
+  ls_data-title      = SY-TITLE.
+  ls_data-descobject = 'ZHR_MASS_F1_06_02'.
+  ls_data-docuobject = ' '.
+  ls_data-subscreen1 = '2002'.
+  ls_data-subscpool1 = SY-CPROG.
+  lv_str = ZPATH.
+
+  PERFORM z_upload_file USING
+                           lv_str
+                           SPACE
+                           8
+                     CHANGING
+                           lt_data.
+  IF LINES( lt_data ) < 2.
+    COMMAND = wizard_command_back.
+    EXIT.
+  ENDIF.
+  PERFORM z_convert_data CHANGING
+                               GT_VDAT
+                               lt_data.
+  PERFORM z_check_data CHANGING
+                             GT_VDAT.
+
+  " Process wizard step
+  call function 'SWF_WIZARD_CALL'
+    EXPORTING
+      wizard_data                 = ls_data
+    EXCEPTIONS
+      operation_cancelled_by_user = 01
+      back                        = 02.
+  swf_evaluate command.
+
+ENDFORM.  " Z_WIZ_PROC_STEP_02
+
+"----------------------------------------------------------------------
+"       Form  Z_WIZ_PROC_STEP_03
+"       Process wizard step 03
+"----------------------------------------------------------------------
+"      --> CONTAINER Table container
+"      --> COMMAND
+"----------------------------------------------------------------------
+FORM Z_WIZ_PROC_STEP_03 TABLES
+                            CONTAINER "#EC NEEDED
+                         USING
+                            COMMAND.  "#EC CALLED
+  DATA:
+    ls_data type swf_wizard.
+
+  PERFORM z_check_lock CHANGING
+                             GT_VDAT.
+
+  swf_exclude 'Z_WIZ_PROC_STEP_04' SY-CPROG.
+  LOOP AT GT_VDAT TRANSPORTING NO FIELDS
+    WHERE STATE = ICON_LED_GREEN
+       OR STATE = ICON_LED_YELLOW.
+    swf_include 'Z_WIZ_PROC_STEP_04' SY-CPROG.
+  ENDLOOP.
+
+  " Initialize wizard step
+  ls_data-title      = SY-TITLE.
+  ls_data-descobject = 'ZHR_MASS_F1_06_03'.
+  ls_data-docuobject = ' '.
+  ls_data-subscreen1 = '2002'.
+  ls_data-subscpool1 = SY-CPROG.
+
+  " Process wizard step
+  call function 'SWF_WIZARD_CALL'
+    EXPORTING
+      wizard_data                 = ls_data
+    EXCEPTIONS
+      operation_cancelled_by_user = 01
+      back                        = 02.
+  swf_evaluate command.
+
+ENDFORM.  " Z_WIZ_PROC_STEP_03
+
+"----------------------------------------------------------------------
+"       Form  Z_WIZ_PROC_STEP_04
+"       Process wizard step 04
+"----------------------------------------------------------------------
+"      --> CONTAINER Table container
+"      --> COMMAND
+"----------------------------------------------------------------------
+FORM Z_WIZ_PROC_STEP_04 TABLES
+                            CONTAINER "#EC NEEDED
+                         USING
+                            COMMAND.  "#EC CALLED
+  DATA:
+    ls_data type swf_wizard.
+
+  " Initialize wizard step
+  ls_data-title      = SY-TITLE.
+  ls_data-descobject = 'ZHR_MASS_F1_06_04'.
+  ls_data-docuobject = ' '.
+  ls_data-back_off   = 'X'.
+  ls_data-end_on     = SPACE.
+  " ls_data-SCREEN_TYP = 'END'.
+  ls_data-END_ON = 'X'.
+  ls_data-subscreen1 = '2002'.
+  ls_data-subscpool1 = SY-CPROG.
+  PERFORM z_load_data_vac USING
+                            zc_logobj
+                            zc_logobjsub
+                            zc_logext
+                       CHANGING
+                            GT_VDAT.
+  swf_exclude 'Z_WIZ_PROC_STEP_02' SY-CPROG.
+  swf_exclude 'Z_WIZ_PROC_STEP_03' SY-CPROG.
+  " Process wizard step
+  call function 'SWF_WIZARD_CALL'
+    EXPORTING
+      wizard_data                 = ls_data
+    EXCEPTIONS
+      operation_cancelled_by_user = 01
+      back                        = 02.
+  swf_evaluate command.
+
+ENDFORM.  " Z_WIZ_PROC_STEP_04
+
+"---------------------------------------------------------------------
+"      Form  Form  Z_SHOW_STEP02
+"      Show interface step 02
+"---------------------------------------------------------------------
+"      --> FU_O_CONT  GUI container
+"---------------------------------------------------------------------
+FORM Z_SHOW_STEP02 USING
+                      FU_O_CONT TYPE REF TO CL_GUI_CONTAINER.
+  DATA:
+    lv_lines     TYPE i,
+    lo_salv      TYPE REF TO CL_SALV_TABLE,
+    lo_functions TYPE REF TO CL_SALV_FUNCTIONS_LIST.
+
+  CHECK SY-BATCH IS INITIAL.
+
+  lv_lines  = LINES( GT_VDAT ).
+  IF lv_lines = 0.
+    MESSAGE ID zc_msgid TYPE 'I' NUMBER 011.
+    EXIT.
+  ENDIF.
+  TRY.
+    CALL METHOD CL_SALV_TABLE=>FACTORY
+      EXPORTING
+        R_CONTAINER    = FU_O_CONT
+      IMPORTING
+        R_SALV_TABLE   = lo_salv
+      CHANGING
+        T_TABLE        = GT_VDAT.
+  CATCH CX_SALV_MSG.
+    RETURN.
+  ENDTRY.
+  PERFORM z_set_fc4alv USING lo_salv.
+  lo_functions = lo_salv->GET_FUNCTIONS( ).
+  lo_functions->SET_DEFAULT( ).
+  lo_functions->SET_EXPORT_LOCALFILE( ABAP_TRUE ).
+  lo_salv->DISPLAY( ).
+ENDFORM.  " Z_SHOW_STEP02
+
+"---------------------------------------------------------------------
+"      Form  Z_SET_FC4ALV
+"      Set field catalog for ALV-grid
+"---------------------------------------------------------------------
+"      --> FU_O_SALV  ALV-grid
+"---------------------------------------------------------------------
+FORM Z_SET_FC4ALV USING
+                    FU_O_SALV TYPE REF TO CL_SALV_TABLE.
+  DATA:
+    lt_fc      TYPE SALV_T_COLUMN_REF,
+    lo_columns TYPE REF TO CL_SALV_COLUMNS_TABLE.
+
+  FIELD-SYMBOLS:
+    <fs_fc> TYPE SALV_S_COLUMN_REF.
+
+  lo_columns   = fu_o_salv->get_columns( ).
+  lt_fc = lo_columns->get( ).
+    LOOP AT lt_fc ASSIGNING <fs_fc>.
+      CASE <fs_fc>-columnname.
+        WHEN 'E_ROW'.
+          <fs_fc>-r_column->set_long_text( TEXT-TL1 ).                 " Max length 20
+          <fs_fc>-r_column->set_medium_text( TEXT-TM1 ).               " Max length 15
+          <fs_fc>-r_column->set_short_text( TEXT-TS1 ).                " Max length 10
+          <fs_fc>-r_column->set_output_length( 4 ).
+         WHEN 'XXXXX'.
+          <fs_fc>-r_column->set_technical( abap_true ).
+      ENDCASE.
+    ENDLOOP.
+  lo_columns->set_optimize( 'X' ).
+ENDFORM.  " Z_SET_FC4ALV
+"---------------------------------------------------------------------
+"      Form  Z_F4_FILE
+"      Search help for file
+"---------------------------------------------------------------------
+FORM Z_F4_FILE .
+  DATA:
+    lv_rc   TYPE SY-SUBRC,
+    lv_str  TYPE STRING,
+    lt_file TYPE FILETABLE.
+
+  FIELD-SYMBOLS:
+    <fs_file> TYPE LINE OF FILETABLE.
+
+  CLEAR:
+    ZFILE,
+    ZPATH.
+  lv_str = TEXT-TFO.
+  CALL METHOD CL_GUI_FRONTEND_SERVICES=>FILE_OPEN_DIALOG
+    EXPORTING
+      WINDOW_TITLE            = lv_str
+      DEFAULT_EXTENSION       = 'XLS'
+  "   INITIAL_DIRECTORY
+      FILE_FILTER  = '(*.XLS)|*.XLS|(*.TXT)|*.TXT|(*.CSV)|*.CSV|'
+      MULTISELECTION          = SPACE
+    CHANGING
+      FILE_TABLE              = lt_file
+      RC                      = lv_rc
+    EXCEPTIONS
+      FILE_OPEN_DIALOG_FAILED = 1
+      CNTL_ERROR              = 2
+      ERROR_NO_GUI            = 3
+      NOT_SUPPORTED_BY_GUI    = 4
+      OTHERS                  = 5.
+  CHECK SY-SUBRC = 0.
+  CLEAR:
+    lv_str.
+  LOOP AT lt_file ASSIGNING <fs_file>.
+    CONCATENATE lv_str <fs_file> INTO lv_str.  " TODO Test long path
+  ENDLOOP.
+  CHECK NOT lv_str IS INITIAL.
+  ZFILE = lv_str.
+  ZPATH = lv_str.
+ENDFORM.  " Z_F4_FILE
+"---------------------------------------------------------------------
+"      Form  Z_GET_MSG_TEXT
+"      Get text message by class and number
+"---------------------------------------------------------------------
+"      --> FU_S_MSG   Message structure
+"      <-- FC_MTEXT   Message text
+"---------------------------------------------------------------------
+FORM Z_GET_MSG_TEXT USING
+                       FU_S_MSG TYPE BAL_S_MSG
+                 CHANGING
+                       FC_MTEXT TYPE BALTMSG.
+  CLEAR:
+    FC_MTEXT.
+
+  CALL FUNCTION 'BAL_DSP_TXT_MSG_READ'
+    EXPORTING
+      I_LANGU        = SY-LANGU
+      I_MSGID        = FU_S_MSG-MSGID
+      I_MSGNO        = FU_S_MSG-MSGNO
+      I_MSGV1        = FU_S_MSG-MSGV1
+      I_MSGV2        = FU_S_MSG-MSGV2
+      I_MSGV3        = FU_S_MSG-MSGV3
+      I_MSGV4        = FU_S_MSG-MSGV4
+    IMPORTING
+      E_MESSAGE_TEXT = FC_MTEXT.
+ENDFORM.  " Z_GET_MSG_TEXT
+
+"----------------------------------------------------------------------
+"       Module  UCOMM_2001  INPUT
+"----------------------------------------------------------------------
+MODULE UCOMM_2001 INPUT.
+
+ENDMODULE.  " UCOMM_2001  INPUT
+"----------------------------------------------------------------------
+"       Module  FILE_F4_VAL  INPUT
+"----------------------------------------------------------------------
+MODULE FILE_F4_VAL INPUT.
+  PERFORM z_f4_file.
+ENDMODULE.  " FILE_F4_VAL  INPUT
+
+"----------------------------------------------------------------------
+"       Module  FIELD_2001  INPUT
+"----------------------------------------------------------------------
+MODULE FIELD_2001 INPUT.
+  ZPATH = ZFILE.
+  ZMASSS = ZMASSS.
+ENDMODULE.  " FIELD_2001  INPUT
+
+"----------------------------------------------------------------------
+"       Module  INIT_2002  OUTPUT
+"----------------------------------------------------------------------
+MODULE INIT_2002 OUTPUT.
+  DATA:
+    lo_cont TYPE REF TO CL_GUI_CONTAINER.
+
+  CREATE OBJECT GO_CUST_CONT
+    EXPORTING
+      CONTAINER_NAME = 'ZCONT'
+      LIFETIME       = CL_GUI_CUSTOM_CONTAINER=>LIFETIME_DYNPRO.
+  lo_cont = GO_CUST_CONT.
+  PERFORM z_show_step02 USING
+                           lo_cont.
+ENDMODULE.  " INIT_2002  OUTPUT
+
+"---------------------------------------------------------------------
+"      Form  ZGET_MOLGA
+"      Get user group
+"---------------------------------------------------------------------
+"      --> FU_PERNR   Personal number
+"      <-- FC_MOLGA   Country group
+"---------------------------------------------------------------------
+FORM ZGET_MOLGA USING
+                   FU_PERNR TYPE PERNR_D
+             CHANGING
+                   FC_MOLGA TYPE MOLGA.
+
+  DATA:
+    lv_werks TYPE PA0001-WERKS.
+
+  CLEAR:
+    FC_MOLGA.
+
+  SELECT WERKS
+    FROM PA0001
+    INTO lv_werks
+   UP TO 1 ROWS
+   WHERE PERNR = FU_PERNR.
+  ENDSELECT.
+  SELECT MOLGA
+    FROM T500P
+    INTO FC_MOLGA
+   UP TO 1 ROWS
+   WHERE PERSA = lv_werks.
+  ENDSELECT.
+  CHECK FC_MOLGA IS INITIAL.
+  FC_MOLGA = '33'.
+ENDFORM.  " ZGET_MOLGA
+
+"---------------------------------------------------------------------
+"      Form  ZGET_USERG
+"      Get user group
+"---------------------------------------------------------------------
+"      --> FU_PERNR   Personal number
+"      <-- FC_USERG   User group
+"---------------------------------------------------------------------
+FORM ZGET_USERG USING
+                  FU_PERNR TYPE PERNR_D
+            CHANGING
+                  FC_USERG TYPE USERG.
+  DATA:
+    lv_molga TYPE MOLGA,
+    lv_userg TYPE T588MAPUGRMOLGA-UGR.
+
+  CLEAR:
+    FC_USERG.
+
+  " Get country of the personal number, see SAP Note 1490267
+  IF CL_HRPYO_SWITCH_CHECK=>HRPYO_SFWS_ENH_01( ) = 'X'.
+    IF FU_PERNR IS NOT INITIAL.
+      PERFORM zget_molga USING
+                            FU_PERNR
+                      CHANGING
+                            lv_molga.
+    ELSE.
+      EXIT.
+    ENDIF.
+    " Get based on the country of the pernr user group
+    SELECT SINGLE UGR
+      INTO lv_userg
+      FROM T588MAPUGRMOLGA CLIENT SPECIFIED
+     WHERE MANDT = SY-MANDT
+       AND MOLGA = lv_molga.
+    IF SY-SUBRC <> 0.
+      GET PARAMETER ID 'UGR' FIELD lv_userg.
+    ENDIF.
+  ELSE.
+    GET PARAMETER ID 'UGR' FIELD lv_userg.
+  ENDIF.
+  IF lv_userg IS INITIAL.
+    FC_USERG = '33'.
+  ELSE.
+    FC_USERG = lv_userg.
+  ENDIF.
+ENDFORM.  " ZGET_USERG
+
+"---------------------------------------------------------------------
+"      Form  ZGET_MENU_POS
+"      Get text menu position by action code
+"---------------------------------------------------------------------
+"      --> FU_TCODE   Transaction code
+"      --> FU_MASSN   Action code
+"      --> FU_USERG   User group
+"      <-- FC_M_POS   Menu position
+"---------------------------------------------------------------------
+FORM ZGET_MENU_POS USING
+                      FU_TCODE TYPE SY-TCODE
+                      FU_MASSN TYPE P0000-MASSN
+                      FU_USERG TYPE USERG
+                CHANGING
+                      FC_M_POS TYPE STRING.
+  STATICS:
+    lv_tcode TYPE T588A-TCODE,
+    lv_mntyp TYPE T588A-MNTYP,
+    lv_menue TYPE T588A-ITMEN,
+    lv_userg TYPE T588C-REFBG,
+    lv_m_pos TYPE STRING.
+
+  DATA:
+    lv_massn TYPE T588B-MASSN,
+    lv_posit TYPE i.
+
+  CLEAR:
+    FC_M_POS.
+
+  IF lv_tcode <> FU_TCODE.
+    CLEAR:
+      lv_userg.
+    lv_tcode = FU_TCODE.
+    SELECT SINGLE MNTYP ITMEN
+      INTO (lv_mntyp, lv_menue)
+      FROM T588A CLIENT SPECIFIED
+     WHERE MANDT = SY-MANDT
+       AND TCODE = lv_tcode.
+    IF SY-SUBRC <> 0.
+      EXIT.
+    ENDIF.
+  ENDIF.
+
+  IF lv_userg <> FU_USERG.
+    lv_userg = FU_USERG.
+    SELECT MASSN
+      INTO lv_massn
+      FROM T588B CLIENT SPECIFIED
+     WHERE MANDT = SY-MANDT
+       AND MNTYP = lv_mntyp
+       AND MENUE = lv_menue
+       AND USERG = lv_userg
+     ORDER BY PRIMARY KEY.
+     ADD 1 TO lv_posit.
+     CHECK lv_massn = FU_MASSN.
+     EXIT.
+    ENDSELECT.
+    lv_m_pos = lv_posit.
+    CONDENSE lv_m_pos.
+  ENDIF.
+  CHECK lv_m_pos <> '0'.
+  FC_M_POS = lv_m_pos.
+ENDFORM.  " ZGET_MENU_POS
+
+"----------------------------------------------------------------------
+"      Form  Z_GET_DEDUC
+"      Get quota deduction
+"----------------------------------------------------------------------
+"      --> FU_PERNR   Personal number
+"      --> FU_KTART   Limit type
+"      --> FU_BEGDA   Begin date
+"      --> FU_ENDDA   End date
+"      --> FC_CQUOT   Check quota flag
+"----------------------------------------------------------------------
+" 1 - No quota
+" 2 - Quota deduction error
+FORM Z_GET_DEDUC USING
+                    FU_PERNR TYPE PERNR_D
+                    FU_KTART TYPE KTART
+                    FU_BEGDA TYPE d
+                    FU_ENDDA TYPE d
+                    FU_P2001 TYPE ANY TABLE
+                    FU_P2006 TYPE ANY TABLE
+              CHANGING
+                    FC_DEDUC TYPE ANY TABLE
+                    FC_RC    TYPE SY-SUBRC.
+
+  DATA:
+    lv_begda   TYPE d,
+    lv_endda   TYPE d,
+    lv_anzhl   TYPE P2006-ANZHL,
+    lv_kverb   TYPE P2006-KVERB,
+    lv_usage   TYPE P2006-KVERB,
+    lv_total   TYPE P2006-KVERB,
+    ls_p2006   TYPE P2006,
+    lt_deduc   TYPE TABLE OF P2006,
+    lt_i2001   TYPE TABLE OF P2001,
+    lt_i2006   TYPE TABLE OF P2006,
+    lt_p2001   TYPE TABLE OF P2001,
+    lt_p2006   TYPE TABLE OF P2006,
+    lt_qdisded TYPE TABLE OF PTDISDED,
+    ls_qdisded TYPE PTDISDED,
+    lt_ktart   TYPE TIM_QUOTA_TYPE_TAB WITH HEADER LINE.
+
+  FIELD-SYMBOLS:
+    <fs_p2006> TYPE P2006,
+    <fs_p2001> TYPE P2001.
+
+  FC_RC = 0.
+  lt_deduc[] = FC_DEDUC[].
+  lt_i2001[] = FU_P2001[].
+  lt_i2006[] = FU_P2006[].
+
+  APPEND FU_KTART  TO lt_ktart.
+  " Get quotas deduction
+  LOOP AT lt_i2006 INTO ls_p2006
+    WHERE BEGDA <= FU_ENDDA
+      AND ENDDA >= FU_BEGDA.
+    LOOP AT lt_deduc TRANSPORTING NO FIELDS
+      WHERE BEGDA = ls_p2006-begda.
+    ENDLOOP.
+    CHECK SY-SUBRC <> 0.
+    REFRESH:
+      lt_p2006.
+    APPEND ls_p2006 TO lt_p2006.
+    REFRESH:
+      lt_p2001.
+    LOOP AT lt_i2001 ASSIGNING <fs_p2001>
+      WHERE BEGDA <= ls_p2006-endda
+        AND ENDDA >= ls_p2006-begda.
+      APPEND <fs_p2001> TO lt_p2001.
+    ENDLOOP.
+    REFRESH:
+      lt_qdisded.
+    CALL FUNCTION 'HR_GET_QUOTA_DEDUCTION'
+      EXPORTING
+        pernum  = FU_PERNR
+        quonum  = ls_p2006-quonr
+        sendda  = ls_p2006-endda
+        quotype = lt_ktart[]
+      TABLES
+        qdisded = lt_qdisded
+        m2001   = lt_p2001
+        m2006   = lt_p2006
+      EXCEPTIONS
+        OTHERS  = 0.
+    CLEAR:
+      lv_kverb.
+    LOOP AT lt_qdisded INTO ls_qdisded.
+      ADD ls_qdisded-quode TO lv_kverb.
+    ENDLOOP.
+    IF lv_kverb <> ls_p2006-kverb.
+      ls_p2006-kverb = lv_kverb.
+      " Quota deduction error
+      FC_RC = 2.
+    ENDIF.
+    APPEND ls_p2006 TO lt_deduc.
+  ENDLOOP.
+  lv_usage = 0.
+  LOOP AT lt_deduc ASSIGNING <fs_p2006>
+    WHERE BEGDA <= FU_ENDDA
+      AND ENDDA >= FU_BEGDA.
+    IF FU_BEGDA >= <fs_p2006>-begda.
+      lv_begda = FU_BEGDA.
+    ELSE.
+      lv_begda = <fs_p2006>-begda.
+    ENDIF.
+    IF FU_ENDDA <= <fs_p2006>-endda.
+      lv_endda = FU_ENDDA.
+    ELSE.
+      lv_endda = <fs_p2006>-endda.
+    ENDIF.
+    lv_kverb = lv_endda - lv_begda + 1.
+    lv_anzhl = <fs_p2006>-anzhl - <fs_p2006>-kverb.
+    IF lv_kverb <= lv_anzhl.
+      ADD lv_kverb TO lv_usage.
+      SUBTRACT lv_kverb FROM <fs_p2006>-kverb.
+    ELSE.
+      ADD <fs_p2006>-kverb TO lv_usage.
+      <fs_p2006>-kverb = 0.
+      FC_RC = 1.
+    ENDIF.
+  ENDLOOP.
+  lv_total = FU_ENDDA - FU_BEGDA + 1.
+  IF lv_total <> lv_usage.
+    FC_RC = 1.
+  ENDIF.
+  FC_DEDUC[] = lt_deduc[].
+ENDFORM.  " Z_GET_DEDUC
